@@ -6,8 +6,7 @@ Single SQLite index over HF Papers, OpenReview, ACL Anthology, and arXiv.
 Supports keyword search, LSA semantic search, and citation-count enrichment.
 
 Usage:
-    python tools/unified_search.py build                     # build unified index from all source caches
-    python tools/unified_search.py update                    # update HF cache then rebuild
+    python tools/unified_search.py update                    # refresh sources + rebuild index
     python tools/unified_search.py search "vision transformer" --limit 20
     python tools/unified_search.py search -e "multimodal reasoning" --limit 20
     python tools/unified_search.py search -e "query" --source hf --limit 10
@@ -595,8 +594,7 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("build", help="Build unified index from all source caches")
-    sub.add_parser("update", help="Update HF cache then rebuild index")
+    sub.add_parser("update", help="Refresh source caches and rebuild unified index")
 
     p_search = sub.add_parser("search", help="Search the unified index")
     p_search.add_argument("query", help="Search query")
@@ -610,9 +608,7 @@ def main():
     sub.add_parser("stats", help="Show index statistics")
 
     args = parser.parse_args()
-    if args.command == "build":
-        cmd_build(args)
-    elif args.command == "update":
+    if args.command == "update":
         cmd_update(args)
     elif args.command == "search":
         cmd_search(args)
