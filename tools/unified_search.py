@@ -355,11 +355,40 @@ def _refresh_arxiv(conn):
 
 
 def _refresh_openreview():
-    print("OpenReview: conference data, no daily refresh needed (use fetch manually for new venues)")
+    import subprocess
+    import os
+    username = os.environ.get("OPENREVIEW_USERNAME")
+    password = os.environ.get("OPENREVIEW_PASSWORD")
+    if not username or not password:
+        print("Refreshing OpenReview: OPENREVIEW_USERNAME/PASSWORD not set, skipping")
+        return
+
+    or_script = SKILL_DIR / "tools" / "openreview_search.py"
+    conferences = [
+        ("ICLR", 2025), ("ICLR", 2026),
+        ("ICML", 2025), ("ICML", 2026),
+        ("NEURIPS", 2025), ("NEURIPS", 2026),
+        ("EMNLP", 2025), ("EMNLP", 2026),
+        ("NAACL", 2025), ("NAACL", 2026),
+    ]
+    print(f"Refreshing OpenReview ({len(conferences)} venue-years)...")
+    for conf, year in conferences:
+        result = subprocess.run(
+            [sys.executable, str(or_script), "fetch", "--conference", conf, "--year", str(year)],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode == 0:
+            line = result.stdout.strip().split("\n")[-1]
+            if "Saved 0" not in line:
+                print(f"  {line}")
+        time.sleep(10)
 
 
 def _refresh_acl():
-    print("ACL Anthology: conference data, no daily refresh needed (use fetch manually for new collections)")
+    import subprocess
+    acl_script = SKILL_DIR / "tools" / "acl_anthology_search.py"
+    print("Refreshing ACL Anthology...")
+    subprocess.run([sys.executable, str(acl_script), "fetch"], check=False)
 
 
 def _enrich_new_papers():
@@ -400,7 +429,12 @@ def _enrich_new_papers():
 
 def cmd_update(args):
     conn = get_db()
-    sources = [args.source] if args.source else ALL_SOURCES
+    # Default update only refreshes hf and arxiv (daily sources)
+    # OpenReview and ACL need explicit --source to refresh (conference data, rarely changes)
+    if args.source:
+        sources = [args.source]
+    else:
+        sources = ["hf", "arxiv"]
 
     for source in sources:
         if source == "hf":
@@ -411,8 +445,10 @@ def cmd_update(args):
             _set_last_updated(conn, "arxiv")
         elif source == "openreview":
             _refresh_openreview()
+            _set_last_updated(conn, "openreview")
         elif source == "acl":
             _refresh_acl()
+            _set_last_updated(conn, "acl")
         print()
 
     conn.close()
