@@ -429,12 +429,10 @@ def _enrich_new_papers():
 
 def cmd_update(args):
     conn = get_db()
-    # Default update only refreshes hf and arxiv (daily sources)
-    # OpenReview and ACL need explicit --source to refresh (conference data, rarely changes)
     if args.source:
         sources = [args.source]
     else:
-        sources = ["hf", "arxiv"]
+        sources = ALL_SOURCES
 
     for source in sources:
         if source == "hf":

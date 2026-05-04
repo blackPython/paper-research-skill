@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -22,11 +23,19 @@ S2_FIELDS = "citationCount,influentialCitationCount,title"
 BATCH_SIZE = 400
 
 
+def _get_headers():
+    api_key = os.environ.get("S2_API_KEY")
+    if api_key:
+        return {"x-api-key": api_key}
+    return {}
+
+
 def get_citation_counts(arxiv_ids):
     """Look up citation counts for a list of arXiv IDs.
 
     Returns a dict mapping arxiv_id -> {citationCount, influentialCitationCount, title}
     """
+    headers = _get_headers()
     results = {}
     for i in range(0, len(arxiv_ids), BATCH_SIZE):
         batch = arxiv_ids[i : i + BATCH_SIZE]
@@ -38,6 +47,7 @@ def get_citation_counts(arxiv_ids):
                     S2_BATCH_URL,
                     params={"fields": S2_FIELDS},
                     json={"ids": s2_ids},
+                    headers=headers,
                     timeout=30,
                 )
                 if r.status_code == 429:
