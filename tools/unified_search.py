@@ -6,12 +6,17 @@ Single SQLite index over HF Papers, OpenReview, ACL Anthology, and arXiv.
 Supports keyword search, LSA semantic search, and citation-count enrichment.
 
 Usage:
-    python tools/unified_search.py update                    # refresh sources + rebuild index
+    python tools/unified_search.py update                              # refresh all sources + rebuild + enrich new
+    python tools/unified_search.py update --source hf                  # refresh only HF, then rebuild
+    python tools/unified_search.py update --source arxiv               # refresh only arXiv, then rebuild
     python tools/unified_search.py search "vision transformer" --limit 20
     python tools/unified_search.py search -e "multimodal reasoning" --limit 20
     python tools/unified_search.py search -e "query" --source hf --limit 10
-    python tools/unified_search.py enrich                    # batch-enrich with citation counts
-    python tools/unified_search.py stats
+    python tools/unified_search.py search -e "query" --since 2025-04-01
+    python tools/unified_search.py enrich                              # enrich all papers missing citations
+    python tools/unified_search.py enrich --paper 2401.06209           # enrich a specific paper
+    python tools/unified_search.py stats                               # full stats
+    python tools/unified_search.py stats --source hf                   # stats for one source
 """
 
 import argparse
@@ -32,6 +37,8 @@ HF_DB = Path.home() / ".local" / "share" / "hf-papers" / "papers.db"
 ARXIV_DB = Path.home() / ".local" / "share" / "arxiv-search" / "papers.db"
 OPENREVIEW_DIR = Path.home() / ".openreview"
 ACL_DB = Path.home() / ".local" / "share" / "acl-anthology" / "papers.db"
+
+ALL_SOURCES = ["hf", "arxiv", "openreview", "acl"]
 
 
 def get_db():
@@ -62,9 +69,33 @@ def get_db():
             built_at TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS update_log (
+            source TEXT PRIMARY KEY,
+            last_updated TEXT
+        )
+    """)
     conn.commit()
     return conn
 
+
+def _get_last_updated(conn, source):
+    row = conn.execute(
+        "SELECT last_updated FROM update_log WHERE source = ?", (source,)
+    ).fetchone()
+    return row["last_updated"] if row else None
+
+
+def _set_last_updated(conn, source):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO update_log (source, last_updated) VALUES (?, ?)",
+        (source, now),
+    )
+    conn.commit()
+
+
+# --- Import functions ---
 
 def _merge_paper(conn, paper_id, title, authors, abstract, published_at,
                  source, venue=None, hf_upvotes=0, github_repo=None,
@@ -78,7 +109,6 @@ def _merge_paper(conn, paper_id, title, authors, abstract, published_at,
         sources = set(existing["sources"].split(","))
         sources.add(source)
         new_upvotes = max(existing["hf_upvotes"] or 0, hf_upvotes or 0)
-        new_venue = existing["venue"] or venue
         conn.execute("""
             UPDATE papers SET sources = ?, hf_upvotes = ?, venue = COALESCE(?, venue),
                    github_repo = COALESCE(?, github_repo),
@@ -169,7 +199,7 @@ def _import_openreview(conn):
         if not papers:
             continue
 
-        conf_year = path.stem  # e.g. ICLR_2025_papers
+        conf_year = path.stem
         parts = conf_year.replace("_papers", "").split("_")
         venue = f"{parts[0]} {parts[1]}" if len(parts) >= 2 else parts[0]
 
@@ -180,7 +210,6 @@ def _import_openreview(conn):
             paper_id = p.get("paper_id", "")
             authors = json.dumps(p.get("authors", [])[:20])
             abstract = p.get("abstract", "")
-            keywords = p.get("keywords", [])
             year = p.get("year")
 
             _merge_paper(
@@ -230,10 +259,12 @@ def _import_acl(conn):
     return count
 
 
-def cmd_build(args):
+# --- Commands ---
+
+def _rebuild_index():
+    """Internal: rebuild unified index from all source caches, preserving citations."""
     conn = get_db()
 
-    # Preserve existing citation counts before rebuild
     existing_citations = {}
     try:
         rows = conn.execute(
@@ -248,7 +279,7 @@ def cmd_build(args):
     conn.commit()
     now = datetime.now(timezone.utc).isoformat()
 
-    print("Building unified index...")
+    print("Rebuilding unified index...")
 
     hf_count = _import_hf(conn)
     conn.commit()
@@ -274,7 +305,6 @@ def cmd_build(args):
         )
     conn.commit()
 
-    # Restore preserved citation counts
     if existing_citations:
         restored = 0
         for paper_id, (cites, inf_cites) in existing_citations.items():
@@ -293,25 +323,103 @@ def cmd_build(args):
     conn.close()
     _invalidate_lsa()
 
-    print(f"\nDone. Total: {total} unique papers ({multi} appear in multiple sources)")
+    print(f"  Total: {total} unique papers ({multi} appear in multiple sources)")
 
 
-def cmd_update(args):
+def _get_arxiv_fetch_days(conn):
+    """Determine how many days to fetch for arXiv based on last update."""
+    last = _get_last_updated(conn, "arxiv")
+    if not last:
+        return 7
+    last_dt = datetime.fromisoformat(last)
+    days_since = (datetime.now(timezone.utc) - last_dt).days
+    return max(days_since + 1, 1)
+
+
+def _refresh_hf():
     import subprocess
-
-    print("Updating HF papers cache...")
+    print("Refreshing HF papers cache...")
     hf_script = SKILL_DIR / "tools" / "hf_papers_cache.py"
     subprocess.run([sys.executable, str(hf_script), "update"], check=False)
 
-    print("\nUpdating arXiv cache (last 7 days)...")
+
+def _refresh_arxiv(conn):
+    import subprocess
+    days = _get_arxiv_fetch_days(conn)
+    print(f"Refreshing arXiv cache (last {days} days)...")
     arxiv_script = SKILL_DIR / "tools" / "arxiv_search.py"
     subprocess.run([sys.executable, str(arxiv_script), "fetch",
-                    "--num-days", "7",
+                    "--num-days", str(days),
                     "--categories", "cs.AI,cs.CL,cs.CV,cs.LG,cs.NE,stat.ML,cs.IR"],
                    check=False)
 
-    print("\nRebuilding unified index...")
-    cmd_build(args)
+
+def _refresh_openreview():
+    print("OpenReview: conference data, no daily refresh needed (use fetch manually for new venues)")
+
+
+def _refresh_acl():
+    print("ACL Anthology: conference data, no daily refresh needed (use fetch manually for new collections)")
+
+
+def _enrich_new_papers():
+    """Enrich only papers that don't have citation data yet."""
+    sys.path.insert(0, str(SKILL_DIR / "tools"))
+    from citation_counts import get_citation_counts
+
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT paper_id FROM papers
+        WHERE paper_id NOT LIKE 'openreview:%'
+          AND paper_id NOT LIKE 'acl:%'
+          AND citation_count IS NULL
+    """).fetchall()
+
+    arxiv_ids = [r["paper_id"] for r in rows]
+    if not arxiv_ids:
+        print("  No new papers to enrich.")
+        conn.close()
+        return
+
+    print(f"  Enriching {len(arxiv_ids)} new papers with citation counts...")
+    results = get_citation_counts(arxiv_ids)
+
+    updated = 0
+    for aid, info in results.items():
+        if info:
+            conn.execute(
+                "UPDATE papers SET citation_count = ?, influential_citations = ? WHERE paper_id = ?",
+                (info["citationCount"], info["influentialCitationCount"], aid),
+            )
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    print(f"  Enriched {updated}/{len(arxiv_ids)} papers.")
+
+
+def cmd_update(args):
+    conn = get_db()
+    sources = [args.source] if args.source else ALL_SOURCES
+
+    for source in sources:
+        if source == "hf":
+            _refresh_hf()
+            _set_last_updated(conn, "hf")
+        elif source == "arxiv":
+            _refresh_arxiv(conn)
+            _set_last_updated(conn, "arxiv")
+        elif source == "openreview":
+            _refresh_openreview()
+        elif source == "acl":
+            _refresh_acl()
+        print()
+
+    conn.close()
+
+    _rebuild_index()
+    print()
+    _enrich_new_papers()
 
 
 def cmd_search(args):
@@ -377,7 +485,7 @@ def _search_semantic(query, limit, fmt, source, since):
     conn.close()
 
     if not rows:
-        print("No papers in index. Run 'build' first.", file=sys.stderr)
+        print("No papers in index. Run 'update' first.", file=sys.stderr)
         sys.exit(1)
 
     docs = [f"{r['title']} {r['abstract'] or ''}" for r in rows]
@@ -420,6 +528,170 @@ def _search_semantic(query, limit, fmt, source, since):
     else:
         for row, score in results:
             _print_paper(row, score=score)
+
+
+def cmd_enrich(args):
+    """Batch-enrich papers with citation counts from Semantic Scholar."""
+    sys.path.insert(0, str(SKILL_DIR / "tools"))
+    from citation_counts import get_citation_counts
+
+    conn = get_db()
+
+    if args.paper:
+        # Enrich specific paper(s)
+        paper_ids = [p.strip() for p in args.paper.split(",")]
+        print(f"Enriching {len(paper_ids)} specific papers...")
+        results = get_citation_counts(paper_ids)
+        updated = 0
+        for pid, info in results.items():
+            if info:
+                conn.execute(
+                    "UPDATE papers SET citation_count = ?, influential_citations = ? WHERE paper_id = ?",
+                    (info["citationCount"], info["influentialCitationCount"], pid),
+                )
+                updated += 1
+                print(f"  {pid}: {info['citationCount']} citations ({info['influentialCitationCount']} influential)")
+            else:
+                print(f"  {pid}: not found on Semantic Scholar")
+        conn.commit()
+        conn.close()
+        print(f"Updated {updated}/{len(paper_ids)} papers.")
+        return
+
+    # Enrich all papers missing citation data
+    source_filter = ""
+    if args.source:
+        source_filter = f"AND sources LIKE '%{args.source}%'"
+
+    rows = conn.execute(f"""
+        SELECT paper_id FROM papers
+        WHERE paper_id NOT LIKE 'openreview:%'
+          AND paper_id NOT LIKE 'acl:%'
+          AND citation_count IS NULL
+          {source_filter}
+    """).fetchall()
+
+    arxiv_ids = [r["paper_id"] for r in rows]
+    if not arxiv_ids:
+        print("All papers already enriched (or no arXiv IDs to look up).")
+        conn.close()
+        return
+
+    print(f"Enriching {len(arxiv_ids)} papers with citation counts...")
+    results = get_citation_counts(arxiv_ids)
+
+    updated = 0
+    for aid, info in results.items():
+        if info:
+            conn.execute(
+                "UPDATE papers SET citation_count = ?, influential_citations = ? WHERE paper_id = ?",
+                (info["citationCount"], info["influentialCitationCount"], aid),
+            )
+            updated += 1
+
+    conn.commit()
+    conn.close()
+    print(f"Done. Updated {updated}/{len(arxiv_ids)} papers.")
+
+
+def cmd_stats(args):
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
+    if total == 0:
+        print("Index is empty. Run 'update' first.")
+        conn.close()
+        return
+
+    source_filter = args.source
+
+    if source_filter:
+        # Stats for a specific source
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE sources LIKE ?", (f"%{source_filter}%",)
+        ).fetchone()[0]
+        with_cites = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE sources LIKE ? AND citation_count IS NOT NULL",
+            (f"%{source_filter}%",)
+        ).fetchone()[0]
+
+        print(f"Source: {source_filter}")
+        print(f"Papers: {cnt}")
+        print(f"With citation data: {with_cites}")
+
+        # Last update
+        last = _get_last_updated(conn, source_filter)
+        if last:
+            print(f"Last updated: {last[:19]}")
+
+        # Top papers from this source
+        top = conn.execute("""
+            SELECT paper_id, title, citation_count, hf_upvotes, venue
+            FROM papers WHERE sources LIKE ?
+            ORDER BY COALESCE(citation_count, 0) DESC LIMIT 10
+        """, (f"%{source_filter}%",)).fetchall()
+
+        if top:
+            print(f"\nTop papers:")
+            for r in top:
+                cites = f"[{r['citation_count']} cites]" if r['citation_count'] else ""
+                upvotes = f"↑{r['hf_upvotes']}" if r['hf_upvotes'] else ""
+                print(f"  {cites:14s} {upvotes:6s}  {r['title'][:55]}")
+
+        conn.close()
+        return
+
+    # Full stats
+    multi_source = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE sources LIKE '%,%'"
+    ).fetchone()[0]
+
+    by_source = {}
+    for src in ALL_SOURCES:
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE sources LIKE ?", (f"%{src}%",)
+        ).fetchone()[0]
+        by_source[src] = cnt
+
+    with_citations = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE citation_count IS NOT NULL"
+    ).fetchone()[0]
+
+    top_cited = conn.execute("""
+        SELECT paper_id, title, citation_count, influential_citations, sources, venue
+        FROM papers WHERE citation_count IS NOT NULL
+        ORDER BY citation_count DESC LIMIT 10
+    """).fetchall()
+
+    top_upvoted = conn.execute("""
+        SELECT paper_id, title, hf_upvotes, sources, venue
+        FROM papers WHERE hf_upvotes > 0
+        ORDER BY hf_upvotes DESC LIMIT 10
+    """).fetchall()
+
+    build_log = conn.execute("SELECT * FROM build_log ORDER BY source").fetchall()
+    update_log = conn.execute("SELECT * FROM update_log ORDER BY source").fetchall()
+    conn.close()
+
+    print(f"Unified Paper Index: {DB_PATH}")
+    print(f"Total papers: {total}")
+    print(f"Multi-source papers: {multi_source}")
+    print(f"Papers with citation data: {with_citations}\n")
+
+    print("Source      | Papers | Last updated")
+    print("------------|--------|--------------------")
+    for src in ALL_SOURCES:
+        last = next((r["last_updated"][:16] for r in update_log if r["source"] == src), "never")
+        print(f"{src:12s}| {by_source[src]:6d} | {last}")
+
+    if top_cited:
+        print(f"\nTop cited papers:")
+        for r in top_cited:
+            print(f"  {r['citation_count']:5d} ({r['influential_citations']:3d} inf)  {r['title'][:55]}  [{r['sources']}]")
+
+    if top_upvoted:
+        print(f"\nTop HF upvoted papers:")
+        for r in top_upvoted:
+            print(f"  ↑{r['hf_upvotes']:4d}  {r['title'][:60]}  [{r['sources']}]")
 
 
 def _print_results(rows, fmt):
@@ -487,106 +759,6 @@ def _invalidate_lsa():
         LSA_PATH.unlink()
 
 
-def cmd_enrich(args):
-    """Batch-enrich papers with citation counts from Semantic Scholar."""
-    sys.path.insert(0, str(SKILL_DIR / "tools"))
-    from citation_counts import get_citation_counts
-
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT paper_id FROM papers
-        WHERE paper_id NOT LIKE 'openreview:%'
-          AND paper_id NOT LIKE 'acl:%'
-          AND citation_count IS NULL
-    """).fetchall()
-
-    arxiv_ids = [r["paper_id"] for r in rows]
-    if not arxiv_ids:
-        print("All papers already enriched (or no arXiv IDs to look up).")
-        conn.close()
-        return
-
-    print(f"Enriching {len(arxiv_ids)} papers with citation counts...")
-    results = get_citation_counts(arxiv_ids)
-
-    updated = 0
-    for aid, info in results.items():
-        if info:
-            conn.execute(
-                "UPDATE papers SET citation_count = ?, influential_citations = ? WHERE paper_id = ?",
-                (info["citationCount"], info["influentialCitationCount"], aid),
-            )
-            updated += 1
-
-    conn.commit()
-    conn.close()
-    print(f"Done. Updated {updated}/{len(arxiv_ids)} papers.")
-
-
-def cmd_stats(args):
-    conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
-    if total == 0:
-        print("Index is empty. Run 'build' first.")
-        conn.close()
-        return
-
-    multi_source = conn.execute(
-        "SELECT COUNT(*) FROM papers WHERE sources LIKE '%,%'"
-    ).fetchone()[0]
-
-    by_source = {}
-    for src in ["hf", "arxiv", "openreview", "acl"]:
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM papers WHERE sources LIKE ?", (f"%{src}%",)
-        ).fetchone()[0]
-        by_source[src] = cnt
-
-    with_citations = conn.execute(
-        "SELECT COUNT(*) FROM papers WHERE citation_count IS NOT NULL"
-    ).fetchone()[0]
-
-    top_cited = conn.execute("""
-        SELECT paper_id, title, citation_count, influential_citations, sources, venue
-        FROM papers WHERE citation_count IS NOT NULL
-        ORDER BY citation_count DESC LIMIT 10
-    """).fetchall()
-
-    top_upvoted = conn.execute("""
-        SELECT paper_id, title, hf_upvotes, sources, venue
-        FROM papers WHERE hf_upvotes > 0
-        ORDER BY hf_upvotes DESC LIMIT 10
-    """).fetchall()
-
-    build_log = conn.execute("SELECT * FROM build_log ORDER BY source").fetchall()
-    conn.close()
-
-    print(f"Unified Paper Index: {DB_PATH}")
-    print(f"Total papers: {total}")
-    print(f"Multi-source papers: {multi_source}")
-    print(f"Papers with citation data: {with_citations}\n")
-
-    print("Source      | Papers")
-    print("------------|-------")
-    for src, cnt in by_source.items():
-        print(f"{src:12s}| {cnt}")
-
-    if build_log:
-        print(f"\nLast build:")
-        for r in build_log:
-            print(f"  {r['source']}: {r['paper_count']} papers ({r['built_at'][:10]})")
-
-    if top_cited:
-        print(f"\nTop cited papers:")
-        for r in top_cited:
-            print(f"  {r['citation_count']:5d} ({r['influential_citations']:3d} inf)  {r['title'][:55]}  [{r['sources']}]")
-
-    if top_upvoted:
-        print(f"\nTop HF upvoted papers:")
-        for r in top_upvoted:
-            print(f"  ↑{r['hf_upvotes']:4d}  {r['title'][:60]}  [{r['sources']}]")
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="unified-search",
@@ -594,18 +766,28 @@ def main():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("update", help="Refresh source caches and rebuild unified index")
+    p_update = sub.add_parser("update", help="Refresh source caches, rebuild index, enrich new papers")
+    p_update.add_argument("--source", choices=ALL_SOURCES, default=None,
+                          help="Refresh only this source (default: all)")
 
     p_search = sub.add_parser("search", help="Search the unified index")
     p_search.add_argument("query", help="Search query")
     p_search.add_argument("-e", "--semantic", action="store_true", help="Use LSA semantic search")
     p_search.add_argument("-l", "--limit", type=int, default=20, help="Max results (default: 20)")
     p_search.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
-    p_search.add_argument("--source", default=None, help="Filter by source (hf, arxiv, openreview, acl)")
+    p_search.add_argument("--source", choices=ALL_SOURCES, default=None,
+                          help="Filter by source (hf, arxiv, openreview, acl)")
     p_search.add_argument("--since", default=None, help="Only papers published after this date (YYYY-MM-DD)")
 
-    sub.add_parser("enrich", help="Batch-enrich papers with Semantic Scholar citation counts")
-    sub.add_parser("stats", help="Show index statistics")
+    p_enrich = sub.add_parser("enrich", help="Enrich papers with Semantic Scholar citation counts")
+    p_enrich.add_argument("--paper", default=None,
+                          help="Specific arXiv ID(s) to enrich, comma-separated")
+    p_enrich.add_argument("--source", choices=ALL_SOURCES, default=None,
+                          help="Only enrich papers from this source")
+
+    p_stats = sub.add_parser("stats", help="Show index statistics")
+    p_stats.add_argument("--source", choices=ALL_SOURCES, default=None,
+                         help="Show stats for only this source")
 
     args = parser.parse_args()
     if args.command == "update":
