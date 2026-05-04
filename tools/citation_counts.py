@@ -54,7 +54,7 @@ def get_citation_counts(arxiv_ids):
                 time.sleep(2)
 
         for aid, paper in zip(batch, r.json()):
-            if paper:
+            if paper and isinstance(paper, dict):
                 results[aid] = {
                     "citationCount": paper.get("citationCount", 0),
                     "influentialCitationCount": paper.get("influentialCitationCount", 0),
