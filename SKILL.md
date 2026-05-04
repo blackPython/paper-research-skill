@@ -90,14 +90,14 @@ python tools/unified_search.py search -e "<query>" --source arxiv --limit 50 --f
 **B. Live keyword search (catches papers too new for cache or differently indexed)**
 
 ```bash
-# HF native search
-hf papers search "<query>" --limit 20 --format json
+# HF native search — pipe results into cache
+hf papers search "<query>" --limit 20 --format json | python tools/unified_search.py ingest --source hf
 
-# arXiv API direct search
-python tools/arxiv_search.py search-api "<query>" --limit 20 --format json
+# arXiv API direct search — pipe results into cache
+python tools/arxiv_search.py search-api "<query>" --limit 20 --format json | python tools/unified_search.py ingest --source arxiv
 ```
 
-Always run both cached semantic search AND live keyword search. They surface different papers — semantic search finds conceptually related work, keyword search finds exact terminology matches.
+Always run both cached semantic search AND live keyword search. They surface different papers — semantic search finds conceptually related work, keyword search finds exact terminology matches. Piping through `ingest` adds any new discoveries to the unified cache so they appear in subsequent searches and are preserved for future sessions.
 
 **C. Trending browse (when user wants "what's new")**
 

@@ -13,6 +13,8 @@ Usage:
     python tools/unified_search.py search -e "multimodal reasoning" --limit 20
     python tools/unified_search.py search -e "query" --source hf --limit 10
     python tools/unified_search.py search -e "query" --since 2025-04-01
+    python tools/unified_search.py ingest --source hf < hf_results.json   # ingest live search results
+    python tools/unified_search.py ingest --source arxiv --file results.json
     python tools/unified_search.py enrich                              # enrich all papers missing citations
     python tools/unified_search.py enrich --paper 2401.06209           # enrich a specific paper
     python tools/unified_search.py stats                               # full stats
@@ -564,6 +566,81 @@ def _search_semantic(query, limit, fmt, source, since):
             _print_paper(row, score=score)
 
 
+def cmd_ingest(args):
+    """Ingest papers from live search results (JSON from stdin or --file) into the unified cache."""
+    conn = get_db()
+
+    if args.file:
+        with open(args.file) as f:
+            data = json.load(f)
+    else:
+        data = json.load(sys.stdin)
+
+    if not isinstance(data, list):
+        data = [data]
+
+    source = args.source or "live"
+    added = 0
+    skipped = 0
+
+    for p in data:
+        # Normalize: handle both HF and arXiv JSON formats
+        paper_id = p.get("arxiv_id") or p.get("id") or p.get("paper_id")
+        if not paper_id:
+            skipped += 1
+            continue
+
+        title = p.get("title", "")
+        abstract = p.get("summary") or p.get("abstract") or ""
+        published = p.get("published_at") or p.get("published") or ""
+        upvotes = p.get("upvotes") or 0
+
+        authors_raw = p.get("authors")
+        if isinstance(authors_raw, list):
+            if authors_raw and isinstance(authors_raw[0], dict):
+                authors = json.dumps([a.get("name", "") for a in authors_raw])
+            else:
+                authors = json.dumps(authors_raw)
+        elif isinstance(authors_raw, str):
+            authors = json.dumps(authors_raw.split(", "))
+        else:
+            authors = "[]"
+
+        github_repo = p.get("github_repo")
+        github_stars = p.get("github_stars")
+        web_url = p.get("url") or p.get("web_url")
+
+        existing = conn.execute(
+            "SELECT paper_id FROM papers WHERE paper_id = ?", (paper_id,)
+        ).fetchone()
+
+        if existing:
+            skipped += 1
+            continue
+
+        _merge_paper(
+            conn,
+            paper_id=paper_id,
+            title=title,
+            authors=authors,
+            abstract=abstract,
+            published_at=published,
+            source=source,
+            hf_upvotes=upvotes,
+            github_repo=github_repo,
+            github_stars=github_stars,
+            web_url=web_url,
+        )
+        added += 1
+
+    conn.commit()
+    conn.close()
+
+    if added > 0:
+        _invalidate_lsa()
+    print(f"Ingested {added} new papers ({skipped} already in cache)")
+
+
 def cmd_enrich(args):
     """Batch-enrich papers with citation counts from Semantic Scholar."""
     sys.path.insert(0, str(SKILL_DIR / "tools"))
@@ -813,6 +890,10 @@ def main():
                           help="Filter by source (hf, arxiv, openreview, acl)")
     p_search.add_argument("--since", default=None, help="Only papers published after this date (YYYY-MM-DD)")
 
+    p_ingest = sub.add_parser("ingest", help="Ingest papers from live search JSON into cache")
+    p_ingest.add_argument("--file", default=None, help="JSON file to ingest (default: read from stdin)")
+    p_ingest.add_argument("--source", default=None, help="Label source (default: 'live')")
+
     p_enrich = sub.add_parser("enrich", help="Enrich papers with Semantic Scholar citation counts")
     p_enrich.add_argument("--paper", default=None,
                           help="Specific arXiv ID(s) to enrich, comma-separated")
@@ -828,6 +909,8 @@ def main():
         cmd_update(args)
     elif args.command == "search":
         cmd_search(args)
+    elif args.command == "ingest":
+        cmd_ingest(args)
     elif args.command == "enrich":
         cmd_enrich(args)
     elif args.command == "stats":
