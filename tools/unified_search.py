@@ -233,6 +233,18 @@ def _import_acl(conn):
 
 def cmd_build(args):
     conn = get_db()
+
+    # Preserve existing citation counts before rebuild
+    existing_citations = {}
+    try:
+        rows = conn.execute(
+            "SELECT paper_id, citation_count, influential_citations FROM papers WHERE citation_count IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            existing_citations[r["paper_id"]] = (r["citation_count"], r["influential_citations"])
+    except Exception:
+        pass
+
     conn.execute("DELETE FROM papers")
     conn.commit()
     now = datetime.now(timezone.utc).isoformat()
@@ -263,6 +275,18 @@ def cmd_build(args):
         )
     conn.commit()
 
+    # Restore preserved citation counts
+    if existing_citations:
+        restored = 0
+        for paper_id, (cites, inf_cites) in existing_citations.items():
+            cur = conn.execute(
+                "UPDATE papers SET citation_count = ?, influential_citations = ? WHERE paper_id = ?",
+                (cites, inf_cites, paper_id),
+            )
+            restored += cur.rowcount
+        conn.commit()
+        print(f"  Restored citation data for {restored} papers")
+
     total = conn.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
     multi = conn.execute(
         "SELECT COUNT(*) FROM papers WHERE sources LIKE '%,%'"
@@ -274,11 +298,20 @@ def cmd_build(args):
 
 
 def cmd_update(args):
-    print("Updating HF cache...")
     import subprocess
+
+    print("Updating HF papers cache...")
     hf_script = SKILL_DIR / "tools" / "hf_papers_cache.py"
     subprocess.run([sys.executable, str(hf_script), "update"], check=False)
-    print()
+
+    print("\nUpdating arXiv cache (last 7 days)...")
+    arxiv_script = SKILL_DIR / "tools" / "arxiv_search.py"
+    subprocess.run([sys.executable, str(arxiv_script), "fetch",
+                    "--num-days", "7",
+                    "--categories", "cs.AI,cs.CL,cs.CV,cs.LG,cs.NE,stat.ML,cs.IR"],
+                   check=False)
+
+    print("\nRebuilding unified index...")
     cmd_build(args)
 
 
