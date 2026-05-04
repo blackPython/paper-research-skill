@@ -3,6 +3,7 @@
 citation-counts: Enrich papers with citation counts from Semantic Scholar.
 
 Supports batch lookup by arXiv ID. Can be used standalone or imported by other tools.
+Uses tenacity for exponential backoff on rate limits.
 
 Usage:
     python citation_counts.py lookup 2401.06209 2310.06825 2403.09611
@@ -14,13 +15,26 @@ import argparse
 import json
 import os
 import sys
-import time
 
 import requests
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+import logging
+
+logger = logging.getLogger(__name__)
 
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 S2_FIELDS = "citationCount,influentialCitationCount,title"
 BATCH_SIZE = 400
+
+
+class RateLimitError(Exception):
+    pass
 
 
 def _get_headers():
@@ -30,6 +44,27 @@ def _get_headers():
     return {}
 
 
+@retry(
+    retry=retry_if_exception_type((RateLimitError, requests.ConnectionError, requests.Timeout)),
+    wait=wait_exponential(multiplier=1, min=2, max=120),
+    stop=stop_after_attempt(7),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _fetch_batch(s2_ids, headers):
+    r = requests.post(
+        S2_BATCH_URL,
+        params={"fields": S2_FIELDS},
+        json={"ids": s2_ids},
+        headers=headers,
+        timeout=30,
+    )
+    if r.status_code == 429:
+        raise RateLimitError(f"429 Too Many Requests")
+    r.raise_for_status()
+    return r.json()
+
+
 def get_citation_counts(arxiv_ids):
     """Look up citation counts for a list of arXiv IDs.
 
@@ -37,33 +72,18 @@ def get_citation_counts(arxiv_ids):
     """
     headers = _get_headers()
     results = {}
+
     for i in range(0, len(arxiv_ids), BATCH_SIZE):
         batch = arxiv_ids[i : i + BATCH_SIZE]
         s2_ids = [f"ArXiv:{aid}" for aid in batch]
 
-        for attempt in range(3):
-            try:
-                r = requests.post(
-                    S2_BATCH_URL,
-                    params={"fields": S2_FIELDS},
-                    json={"ids": s2_ids},
-                    headers=headers,
-                    timeout=30,
-                )
-                if r.status_code == 429:
-                    wait = 5 * (attempt + 1)
-                    print(f"Rate limited, waiting {wait}s...", file=sys.stderr)
-                    time.sleep(wait)
-                    continue
-                r.raise_for_status()
-                break
-            except requests.RequestException as e:
-                if attempt == 2:
-                    print(f"Failed after 3 attempts: {e}", file=sys.stderr)
-                    return results
-                time.sleep(2)
+        try:
+            data = _fetch_batch(s2_ids, headers)
+        except Exception as e:
+            print(f"Failed batch {i//BATCH_SIZE + 1}: {e}", file=sys.stderr)
+            continue
 
-        for aid, paper in zip(batch, r.json()):
+        for aid, paper in zip(batch, data):
             if paper and isinstance(paper, dict):
                 results[aid] = {
                     "citationCount": paper.get("citationCount", 0),
@@ -72,9 +92,6 @@ def get_citation_counts(arxiv_ids):
                 }
             else:
                 results[aid] = None
-
-        if i + BATCH_SIZE < len(arxiv_ids):
-            time.sleep(1)
 
     return results
 
@@ -107,6 +124,8 @@ def cmd_lookup(args):
 
 
 def main():
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+
     parser = argparse.ArgumentParser(
         prog="citation-counts",
         description="Look up citation counts from Semantic Scholar",
